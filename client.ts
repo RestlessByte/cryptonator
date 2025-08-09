@@ -1,5 +1,4 @@
 'use client';
-
 /**
  * Secure symmetric crypto for the browser (and Node fallback).
  * - Keeps original API and message layout:
@@ -7,76 +6,61 @@
  * - Uses WebCrypto (fast, non-blocking) with Node fallback if needed.
  *
  * Developer: RestlessByte (https://github.com/RestlessByte)
- * Maintainer notes:
- * - We do not change the external function names or behavior contracts.
- * - We harden inputs, lengths, and add AAD binding option (context) kept internal for compatibility.
  */
 
 type ICryptoKey = string[];
 
 interface ICryptoConfig {
-  ivLength: number;      // 12 bytes is standard for AES-GCM
-  saltLength: number;    // 16 bytes salt
-  tagLength: number;     // bits
+  ivLength: number;
+  saltLength: number;
+  tagLength: number; // bits
 }
 
 const CONFIG: ICryptoConfig = {
   ivLength: 12,
   saltLength: 16,
-  tagLength: 128, // AES-GCM tag length in bits (16 bytes)
+  tagLength: 128,
 };
 
-/* --------------------------
-   Environment abstractions
----------------------------*/
+/* ------------------ Environment ------------------ */
 
-/** Get WebCrypto subtle (browser or Node). */
 const getSubtle = (): SubtleCrypto => {
   if (typeof globalThis !== 'undefined') {
-    // Browser crypto
     // @ts-ignore
-    if (globalThis.crypto && globalThis.crypto.subtle) return globalThis.crypto.subtle as SubtleCrypto;
-    // Node >= 19 has global crypto.subtle
+    if (globalThis.crypto?.subtle) return globalThis.crypto.subtle as SubtleCrypto;
     // @ts-ignore
     if (typeof require === 'function') {
       try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
         const nodeCrypto = require('crypto');
-        if (nodeCrypto.webcrypto && nodeCrypto.webcrypto.subtle) return nodeCrypto.webcrypto.subtle as SubtleCrypto;
+        if (nodeCrypto.webcrypto?.subtle) return nodeCrypto.webcrypto.subtle as SubtleCrypto;
       } catch { }
     }
   }
-  throw new Error('SubtleCrypto is not available in this environment.');
+  throw new Error('SubtleCrypto is not available.');
 };
 
-/** CSPRNG bytes (browser or Node). */
 const randomBytes = (len: number): Uint8Array => {
   const out = new Uint8Array(len);
-  if (typeof globalThis !== 'undefined' && (globalThis.crypto?.getRandomValues)) {
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
     globalThis.crypto.getRandomValues(out);
     return out;
   }
   // @ts-ignore
   if (typeof require === 'function') {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const nodeCrypto = require('crypto');
-      return new Uint8Array(nodeCrypto.randomBytes(len));
-    } catch { }
+    const nodeCrypto = require('crypto');
+    return new Uint8Array(nodeCrypto.randomBytes(len));
   }
   throw new Error('Secure random generator is not available.');
 };
 
-/* --------------------------
-   Encoding helpers
----------------------------*/
+/* ------------------ Encoding ------------------ */
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-/** Base64 encode ArrayBuffer */
 const toBase64 = (buf: ArrayBuffer | Uint8Array): string => {
   const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  // Browser
   if (typeof btoa === 'function') {
     let s = '';
     for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
@@ -87,7 +71,6 @@ const toBase64 = (buf: ArrayBuffer | Uint8Array): string => {
   return Buffer.from(u8).toString('base64');
 };
 
-/** Base64 decode to Uint8Array */
 const fromBase64 = (b64: string): Uint8Array => {
   if (typeof atob === 'function') {
     const bin = atob(b64);
@@ -101,7 +84,7 @@ const fromBase64 = (b64: string): Uint8Array => {
 };
 
 const isBase64 = (data: string): boolean => {
-  if (typeof data !== 'string' || data.length === 0) return false;
+  if (typeof data !== 'string' || !data.length) return false;
   try {
     const dec = fromBase64(data);
     return toBase64(dec) === data;
@@ -110,14 +93,8 @@ const isBase64 = (data: string): boolean => {
   }
 };
 
-/* --------------------------
-   Key derivation (compatible)
----------------------------*/
+/* ------------------ KDF ------------------ */
 
-/**
- * Derive 32-byte key from array of strings + salt using SHA-256 over concatenation.
- * We keep the logic shape (concat + hash) to stay compatible, but use WebCrypto.
- */
 const deriveCombinedKey = async (keys: ICryptoKey, salt: Uint8Array): Promise<Uint8Array> => {
   if (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== 'string' || !k.trim())) {
     throw new Error('Valid non-empty keys must be provided.');
@@ -125,32 +102,21 @@ const deriveCombinedKey = async (keys: ICryptoKey, salt: Uint8Array): Promise<Ui
   const combined = enc.encode(keys.join('') + Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join(''));
   const subtle = getSubtle();
   const digest = await subtle.digest('SHA-256', combined);
-  return new Uint8Array(digest); // 32 bytes
+  return new Uint8Array(digest);
 };
 
-/* --------------------------
-   AES-GCM wrappers
----------------------------*/
+/* ------------------ AES-GCM ------------------ */
 
 const importAesKey = async (rawKey32: Uint8Array): Promise<CryptoKey> => {
   const subtle = getSubtle();
-  return subtle.importKey(
-    'raw',
-    rawKey32,
-    { name: 'AES-GCM', length: 256 },
-    false,
-    ['encrypt', 'decrypt']
-  );
+  const buf = rawKey32.byteOffset === 0 && rawKey32.byteLength === rawKey32.buffer.byteLength
+    ? rawKey32.buffer
+    : rawKey32.buffer.slice(rawKey32.byteOffset, rawKey32.byteOffset + rawKey32.byteLength);
+  return subtle.importKey('raw', buf, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 };
 
-/**
- * Encrypt data (keeps output layout: salt | iv | authTag | ciphertext).
- * @returns Base64 string
- */
 export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<string> => {
-  if (data === undefined || data === null) {
-    throw new Error('No data to encrypt.');
-  }
+  if (data === undefined || data === null) throw new Error('No data to encrypt.');
 
   const salt = randomBytes(CONFIG.saltLength);
   const iv = randomBytes(CONFIG.ivLength);
@@ -165,7 +131,6 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
     plaintext
   ));
 
-  // Split tag (last 16 bytes) to keep your original layout
   if (ciphertextWithTag.length < 16) throw new Error('Encryption failed (ciphertext too short).');
   const authTag = ciphertextWithTag.slice(ciphertextWithTag.length - 16);
   const ciphertext = ciphertextWithTag.slice(0, ciphertextWithTag.length - 16);
@@ -179,20 +144,12 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
   return toBase64(out);
 };
 
-/**
- * Decrypt data (expects layout: salt | iv | authTag | ciphertext).
- * If input is not base64, returns it as-is (compatibility).
- */
 export const decryptedDataClient = async (encryptedData: any, keys: ICryptoKey): Promise<any> => {
-  if (!encryptedData) {
-    throw new Error('No data provided for decryption or data is invalid.');
-  }
-  if (typeof encryptedData !== 'string' || !isBase64(encryptedData)) {
-    return encryptedData;
-  }
+  if (!encryptedData) throw new Error('No data provided for decryption.');
+  if (typeof encryptedData !== 'string' || !isBase64(encryptedData)) return encryptedData;
 
   const buf = fromBase64(encryptedData);
-  const need = CONFIG.saltLength + CONFIG.ivLength + 16; // + at least 1 byte ciphertext
+  const need = CONFIG.saltLength + CONFIG.ivLength + 16;
   if (buf.length <= need) throw new Error('Encrypted payload is too short.');
 
   const salt = buf.slice(0, CONFIG.saltLength);
@@ -203,7 +160,6 @@ export const decryptedDataClient = async (encryptedData: any, keys: ICryptoKey):
   const keyMaterial = await deriveCombinedKey(keys, salt);
   const aesKey = await importAesKey(keyMaterial);
 
-  // Re-attach tag (WebCrypto expects tag appended)
   const cipherWithTag = new Uint8Array(ciphertext.length + authTag.length);
   cipherWithTag.set(ciphertext, 0);
   cipherWithTag.set(authTag, ciphertext.length);
@@ -217,6 +173,6 @@ export const decryptedDataClient = async (encryptedData: any, keys: ICryptoKey):
     );
     return JSON.parse(dec.decode(new Uint8Array(plain)));
   } catch {
-    throw new Error('Failed to decrypt. Check keys or data integrity.');
+    throw new Error('Failed to decrypt. Check keys or integrity.');
   }
 };
