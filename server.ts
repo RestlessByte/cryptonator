@@ -1,21 +1,10 @@
 /**
- * Hardened server-side cryptography, preserving existing exports and shape.
- *
- * What changed (security):
- * - Standardized IV (12) and salt (16) sizes.
- * - Strong input validation and constant-time utilities.
- * - Versioned envelope + optional AAD binding.
- * - Pseudo-lattice Feistel kept (compat), but lengths & checks enforced.
- * - KEM (node-oqs) path kept; guarded and validated.
- * - Uses AES-256-GCM only with secure sizes; rejects weird sizes.
- *
+ * Hardened server-side cryptography.
  * Developer: RestlessByte (https://github.com/RestlessByte)
  */
 
 import crypto, { CipherGCM, DecipherGCM, randomBytes, timingSafeEqual } from 'crypto';
-// node-oqs is optional; we keep require form to avoid crash if not installed.
-let oqs: any = null;
-try { oqs = require('node-oqs'); } catch { /* optional */ }
+let oqs: any = null; try { oqs = require('node-oqs'); } catch {}
 
 type ICryptoKey = string[];
 
@@ -28,19 +17,16 @@ interface ICryptoConfig {
 }
 
 const CFG: ICryptoConfig = {
-  ivLength: 12,                 // AES-GCM standard
-  saltLength: 16,               // 128-bit salt
-  tagLength: 128,               // 16 bytes tag
-  keyAlgorithm: 'sha256',       // Hash for PBKDF2/KDF
+  ivLength: 12,
+  saltLength: 16,
+  tagLength: 128,
+  keyAlgorithm: 'sha256',
   encryptionAlgorithm: 'aes-256-gcm',
 };
 
-// Envelope format version (bump to invalidate old formats if needed)
 const ENV_VERSION = 1;
 
-/* --------------------------
-   Utils
----------------------------*/
+/* utils */
 
 const isBase64 = (data: string): boolean => {
   if (typeof data !== 'string' || data.length === 0) return false;
@@ -50,39 +36,23 @@ const isBase64 = (data: string): boolean => {
   } catch { return false; }
 };
 
-const ctEqual = (a: Buffer, b: Buffer): boolean => {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-};
+const ctEqual = (a: Buffer, b: Buffer): boolean => a.length === b.length && timingSafeEqual(a, b);
 
-const u8 = (len: number) => new Uint8Array(len);
+/* KDF */
 
-/* --------------------------
-   KDFs
----------------------------*/
-
-/**
- * PBKDF2( keys.concat() , salt, high iters ) -> 32 bytes, then SHA3-256 (if available).
- * Keeps your lattice-derivation spirit; validated sizes and errors.
- */
 const deriveLatticeKey = async (keys: ICryptoKey, salt: Buffer): Promise<Buffer> => {
   if (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== 'string' || !k.trim())) {
     throw new Error('Valid non-empty keys must be provided.');
   }
   const material = keys.join('');
   const pbkdf2 = await new Promise<Buffer>((resolve, reject) => {
-    crypto.pbkdf2(material, salt, 620_000, 32, 'sha256', (err, dk) => {
-      if (err) reject(err); else resolve(dk);
-    });
+    crypto.pbkdf2(material, salt, 620_000, 32, 'sha256', (err, dk) => err ? reject(err) : resolve(dk));
   });
-  // Prefer SHA3-256 when available; otherwise SHA-256 again.
   const algo = crypto.getHashes().includes('sha3-256') ? 'sha3-256' : 'sha256';
-  return crypto.createHash(algo).update(pbkdf2).digest(); // 32 bytes
+  return crypto.createHash(algo).update(pbkdf2).digest();
 };
 
-/* --------------------------
-   Feistel (compat with your previous approach)
----------------------------*/
+/* Feistel (compat) */
 
 const FEISTEL_ROUNDS = 16;
 const makeRoundKeys = (latticeKey: Buffer): Buffer[] => {
@@ -100,7 +70,6 @@ const feistelEncrypt = (block32: Buffer, roundKeys: Buffer[]): Buffer => {
   let L = Buffer.from(block32.slice(0, half));
   let R = Buffer.from(block32.slice(half));
   const algo = crypto.getHashes().includes('sha3-256') ? 'sha3-256' : 'sha256';
-
   for (let i = 0; i < roundKeys.length; i++) {
     const f = crypto.createHash(algo).update(Buffer.concat([R, roundKeys[i]])).digest().subarray(0, half);
     const newR = Buffer.alloc(half);
@@ -116,7 +85,6 @@ const feistelDecrypt = (block32: Buffer, roundKeys: Buffer[]): Buffer => {
   let R = Buffer.from(block32.slice(0, half));
   let L = Buffer.from(block32.slice(half));
   const algo = crypto.getHashes().includes('sha3-256') ? 'sha3-256' : 'sha256';
-
   for (let i = roundKeys.length - 1; i >= 0; i--) {
     const f = crypto.createHash(algo).update(Buffer.concat([L, roundKeys[i]])).digest().subarray(0, half);
     const newL = Buffer.alloc(half);
@@ -138,9 +106,7 @@ const latticeDecryptKey = (encryptedKey: Buffer, latticeKey: Buffer): Buffer => 
   return feistelDecrypt(encryptedKey, rks);
 };
 
-/* --------------------------
-   AES-GCM helpers
----------------------------*/
+/* AES-GCM */
 
 const importAesKeyNode = (raw32: Buffer) => {
   if (raw32.length !== 32) throw new Error('AES-256 key must be 32 bytes.');
@@ -163,41 +129,20 @@ const aesGcmDecrypt = (key32: Buffer, iv: Buffer, ciphertext: Buffer, tag: Buffe
   return pt;
 };
 
-/* --------------------------
-   Envelope building
----------------------------*/
+/* Envelope */
 
-/**
- * Build: version(1) | salt(16) | iv(12) | tag(16) | encSessionKey(32) | ciphertext
- * - We keep your original visible structure (salt|iv|tag|encSessionKey|ct) but prepend 1 byte version.
- * - AAD binds: "srv:quant" + version.
- */
 const buildAAD = () => Buffer.from(`srv:quant:v${ENV_VERSION}`, 'utf8');
 
-/**
- * QUANT ENCRYPT (compat name): quantEncryptedData
- */
 export const quantEncryptedData = async (data: any, keys: ICryptoKey): Promise<string> => {
   if (data === undefined || data === null) throw new Error('No data provided for encryption.');
-
   const salt = randomBytes(CFG.saltLength);
   const iv = randomBytes(CFG.ivLength);
   const latticeKey = await deriveLatticeKey(keys, Buffer.from(salt));
   const sessionKey = randomBytes(32);
   const aad = buildAAD();
-
   const { ct, tag } = aesGcmEncrypt(Buffer.from(sessionKey), Buffer.from(iv), Buffer.from(JSON.stringify(data), 'utf8'), aad);
   const encSess = latticeEncryptKey(Buffer.from(sessionKey), latticeKey);
-
-  // version + salt + iv + tag + encSess + ct
-  const out = Buffer.concat([
-    Buffer.from([ENV_VERSION]),
-    Buffer.from(salt),
-    Buffer.from(iv),
-    tag,
-    encSess,
-    ct
-  ]);
+  const out = Buffer.concat([Buffer.from([ENV_VERSION]), Buffer.from(salt), Buffer.from(iv), tag, encSess, ct]);
   return out.toString('base64');
 };
 
@@ -206,7 +151,7 @@ export const quantDecryptedData = async (encryptedData: any, keys: ICryptoKey): 
   if (typeof encryptedData !== 'string' || !isBase64(encryptedData)) return encryptedData;
 
   const buf = Buffer.from(encryptedData, 'base64');
-  const min = 1 + CFG.saltLength + CFG.ivLength + 16 + 32 + 1; // version + salt + iv + tag + encKey + >=1 ct
+  const min = 1 + CFG.saltLength + CFG.ivLength + 16 + 32 + 1;
   if (buf.length < min) throw new Error('Encrypted payload too short.');
 
   const version = buf.readUInt8(0);
@@ -231,15 +176,9 @@ export const quantDecryptedData = async (encryptedData: any, keys: ICryptoKey): 
   }
 };
 
-/* ---------------------------------------------------------------------------
-   Post-quantum KEM path (optional): retains your original API.
----------------------------------------------------------------------------*/
+/* PQ KEM (optional) */
 
-interface IPQKeyPair {
-  publicKey: Buffer;
-  privateKey: Buffer;
-}
-
+interface IPQKeyPair { publicKey: Buffer; privateKey: Buffer; }
 const PQC_ALGORITHM = 'Kyber512';
 const KEM_AVAILABLE = !!oqs;
 
@@ -250,11 +189,6 @@ export const generatePostQuantumKeyPair = (): IPQKeyPair => {
   return { publicKey: Buffer.from(publicKey), privateKey: Buffer.from(secretKey) };
 };
 
-/**
- * secureEncryptData(data, recipientPublicKey) -> Base64( encapsulatedKey | iv | tag | ciphertext )
- * - Keeps your function name and layout.
- * - Uses SHA-256(sharedSecret) => AES-256-GCM key.
- */
 export const secureEncryptData = async (data: any, recipientPublicKey: Buffer): Promise<string> => {
   if (!KEM_AVAILABLE) throw new Error('node-oqs is not available.');
   if (data === undefined || data === null) throw new Error('No data provided for encryption.');
@@ -262,7 +196,7 @@ export const secureEncryptData = async (data: any, recipientPublicKey: Buffer): 
 
   const kem = new oqs.KEM(PQC_ALGORITHM);
   const { sharedSecret, encapsulatedKey } = kem.encapsulate(recipientPublicKey);
-  const symKey = crypto.createHash(CFG.keyAlgorithm).update(Buffer.from(sharedSecret)).digest(); // 32 bytes
+  const symKey = crypto.createHash(CFG.keyAlgorithm).update(Buffer.from(sharedSecret)).digest();
 
   const iv = randomBytes(CFG.ivLength);
   const aad = Buffer.from('srv:kem:v1', 'utf8');
@@ -304,20 +238,12 @@ export const secureDecryptData = async (encryptedData: any, recipientPrivateKey:
   }
 };
 
-/* ---------------------------------------------------------------------------
-   Extra hardening helpers (optional exports)
----------------------------------------------------------------------------*/
-
-/**
- * Validate minimal structure of quant-encrypted payload (base64 + minimal length + version).
- * Returns boolean without throwing.
- */
+/* Validator */
 export const validateQuantPayload = (b64: string): boolean => {
   if (!isBase64(b64)) return false;
   const buf = Buffer.from(b64, 'base64');
   if (buf.length < 1) return false;
-  const ver = buf.readUInt8(0);
-  if (ver !== ENV_VERSION) return false;
+  if (buf.readUInt8(0) !== ENV_VERSION) return false;
   const min = 1 + CFG.saltLength + CFG.ivLength + 16 + 32 + 1;
   return buf.length >= min;
 };
