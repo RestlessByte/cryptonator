@@ -4,26 +4,21 @@
  * Layers cycle: [0] AES-256-GCM (AEAD), [1] AES-CTR + HMAC-SHA-256 (EtM),
  *               [2] AES-CBC + HMAC-SHA-256 (PKCS#7 + EtM), then repeat.
  *
- * - #layers = keys.length
- * - Heavy KDF once: PBKDF2-HMAC-SHA-256 (310k) -> IKM (32B)
- * - Import IKM as HKDF key; per-layer subkeys via HKDF(SHA-256, salt, info)
- * - Unique salt/iv/tag per layer; GCM binds AAD = context + layer index
- * - CTR/CBC layers use Encrypt-then-MAC: HMAC(iv || ciphertext || context)
- * - Envelope = Base64(UTF-8 JSON): { v, kdf, s, t, layers[], ct }
- *
- * Author: RestlessByte + GPT assist
+ * Кол-во слоёв = keys.length.
+ * Главный фикс: ВСЕ данные в WebCrypto передаются как КОПИЯ Uint8Array -> ArrayBuffer
+ * (никаких .buffer напрямую), чтобы исключить SharedArrayBuffer/ArrayBufferLike конфликты.
  */
 
 type ICryptoKey = string[];
 
 interface IConfig {
   pbkdf2Iterations: number;
-  pbkdf2SaltLen: number; // Base salt length for PBKDF2
-  hkdfSaltLen: number;   // Per-layer salt length
-  gcmIvLen: number;      // 12 bytes
-  ctrIvLen: number;      // 16 bytes counter block
-  cbcIvLen: number;      // 16 bytes IV
-  gcmTagLen: number;     // bits
+  pbkdf2SaltLen: number;
+  hkdfSaltLen: number;
+  gcmIvLen: number;   // 12 bytes
+  ctrIvLen: number;   // 16 bytes
+  cbcIvLen: number;   // 16 bytes
+  gcmTagLen: number;  // bits
 }
 
 const CONFIG: IConfig = {
@@ -36,7 +31,7 @@ const CONFIG: IConfig = {
   gcmTagLen: 128,
 };
 
-/* ---------- Environment ---------- */
+/* ---------- Env ---------- */
 type AnySubtle = SubtleCrypto;
 
 const getSubtle = (): AnySubtle => {
@@ -47,7 +42,7 @@ const getSubtle = (): AnySubtle => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const nodeCrypto = require('crypto');
     if (nodeCrypto?.webcrypto?.subtle) return nodeCrypto.webcrypto.subtle as AnySubtle;
-  } catch {}
+  } catch { }
   throw new Error('SubtleCrypto is not available.');
 };
 
@@ -59,7 +54,7 @@ const getCrypto = (): Crypto => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const nodeCrypto = require('crypto');
     return nodeCrypto.webcrypto as unknown as Crypto;
-  } catch {}
+  } catch { }
   throw new Error('Crypto is not available.');
 };
 
@@ -92,7 +87,7 @@ const fromBase64 = (b64: string): Uint8Array => {
     return out;
   }
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  return require('buffer').Buffer.from(b64, 'base64');
+  return new (require('buffer').Buffer)(b64, 'base64');
 };
 
 const isBase64 = (s: string): boolean => {
@@ -109,13 +104,14 @@ const concatU8 = (...parts: Uint8Array[]) => {
   return out;
 };
 
+/** Гарантированный обычный ArrayBuffer (не SharedArrayBuffer) */
 const toArrayBuffer = (u8: Uint8Array): ArrayBuffer => {
   const copy = new Uint8Array(u8.byteLength);
   copy.set(u8);
   return copy.buffer;
 };
 
-/* ---------- Context (AAD / binding) ---------- */
+/* ---------- Context ---------- */
 const ctxBase = 'ctx:v3|purpose=app-transport|suite=GCM+CTR-HMAC+CBC-HMAC|v=3';
 const aadFor = (saltLen: number, layerIndex: number): Uint8Array =>
   enc.encode(`${ctxBase}|pbkdf2SaltLen=${saltLen}|layer=${layerIndex}`);
@@ -128,7 +124,6 @@ const joinKeysMaterial = (keys: ICryptoKey): Uint8Array => {
   const parts: number[] = [];
   for (const k of keys) {
     const b = enc.encode(k);
-    // 4-byte big-endian len + bytes + 0x00 separator
     parts.push((b.length >>> 24) & 0xff, (b.length >>> 16) & 0xff, (b.length >>> 8) & 0xff, b.length & 0xff);
     for (let i = 0; i < b.length; i++) parts.push(b[i]);
     parts.push(0x00);
@@ -141,16 +136,17 @@ const importPBKDF2Base = async (keys: ICryptoKey): Promise<CryptoKey> => {
   return getSubtle().importKey('raw', toArrayBuffer(material), 'PBKDF2', false, ['deriveBits']);
 };
 
-// PBKDF2 -> IKM (32B) -> import as HKDF key (for deriveBits per-layer)
+// PBKDF2 -> IKM(32B) -> HKDF key
 const deriveHKDFMaster = async (keys: ICryptoKey, saltPBKDF2: Uint8Array): Promise<CryptoKey> => {
   const base = await importPBKDF2Base(keys);
   const subtle = getSubtle();
-  const ikm = await subtle.deriveBits(
+  const ikmBits = await subtle.deriveBits(
     { name: 'PBKDF2', salt: toArrayBuffer(saltPBKDF2), iterations: CONFIG.pbkdf2Iterations, hash: 'SHA-256' },
     base,
     32 * 8
   );
-  return subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const ikm = new Uint8Array(ikmBits);
+  return subtle.importKey('raw', toArrayBuffer(ikm), 'HKDF', false, ['deriveBits']);
 };
 
 // HKDF derive bytes
@@ -164,19 +160,20 @@ const hkdfBytes = async (hkdfKey: CryptoKey, salt: Uint8Array, info: Uint8Array,
   return new Uint8Array(bits);
 };
 
-const importAesGcmKey = async (raw: ArrayBuffer): Promise<CryptoKey> =>
-  getSubtle().importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt','decrypt']);
+// Import helpers that ALWAYS take Uint8Array and convert via toArrayBuffer
+const importAesGcmKey = async (raw: Uint8Array): Promise<CryptoKey> =>
+  getSubtle().importKey('raw', toArrayBuffer(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 
-const importAesCtrKey = async (raw: ArrayBuffer): Promise<CryptoKey> =>
-  getSubtle().importKey('raw', raw, { name: 'AES-CTR' }, false, ['encrypt','decrypt']);
+const importAesCtrKey = async (raw: Uint8Array): Promise<CryptoKey> =>
+  getSubtle().importKey('raw', toArrayBuffer(raw), { name: 'AES-CTR' }, false, ['encrypt', 'decrypt']);
 
-const importAesCbcKey = async (raw: ArrayBuffer): Promise<CryptoKey> =>
-  getSubtle().importKey('raw', raw, { name: 'AES-CBC' }, false, ['encrypt','decrypt']);
+const importAesCbcKey = async (raw: Uint8Array): Promise<CryptoKey> =>
+  getSubtle().importKey('raw', toArrayBuffer(raw), { name: 'AES-CBC' }, false, ['encrypt', 'decrypt']);
 
-const importHmacKey = async (raw: ArrayBuffer): Promise<CryptoKey> =>
-  getSubtle().importKey('raw', raw, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign','verify']);
+const importHmacKey = async (raw: Uint8Array): Promise<CryptoKey> =>
+  getSubtle().importKey('raw', toArrayBuffer(raw), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
 
-/* ---------- PKCS#7 padding for CBC ---------- */
+/* ---------- PKCS#7 for CBC ---------- */
 function pkcs7Pad(data: Uint8Array, blockSize = 16): Uint8Array {
   const padLen = blockSize - (data.length % blockSize || blockSize);
   const pad = new Uint8Array(padLen);
@@ -191,7 +188,7 @@ function pkcs7Unpad(data: Uint8Array, blockSize = 16): Uint8Array {
   return data.slice(0, data.length - padLen);
 }
 
-/* ---------- Layer primitives ---------- */
+/* ---------- Layer primitives (ArrayBuffer-safe) ---------- */
 async function encryptGCM(plaintext: Uint8Array, key: CryptoKey, iv: Uint8Array, aad: Uint8Array) {
   const subtle = getSubtle();
   const params: AesGcmParams = { name: 'AES-GCM', iv: toArrayBuffer(iv), tagLength: CONFIG.gcmTagLen, additionalData: toArrayBuffer(aad) };
@@ -245,20 +242,20 @@ async function decryptCBC_HMAC(ciphertext: Uint8Array, tag: Uint8Array, encKey: 
 type AlgId = 'GCM' | 'CTR-HMAC' | 'CBC-HMAC';
 
 interface LayerMeta {
-  a: AlgId;   // algorithm id
+  a: AlgId;
   sl: string; // hkdf salt (b64)
-  iv: string; // iv / counter (b64)
-  tg: string; // tag (b64) - GCM tag or HMAC tag
+  iv: string; // iv/counter (b64)
+  tg: string; // tag (b64)
 }
 
 interface Envelope {
-  v: number;     // format version
-  kdf: string;   // "PBKDF2-310k->HKDF"
-  s: string;     // pbkdf2 salt (b64)
-  t: number;     // gcm tag bits (for reference)
-  n: number;     // number of layers
+  v: number;
+  kdf: string;
+  s: string;  // pbkdf2 salt (b64)
+  t: number;  // gcm tag bits
+  n: number;  // layers count
   layers: LayerMeta[]; // outer -> inner
-  ct: string;    // ciphertext of outermost layer
+  ct: string; // outermost ciphertext
 }
 
 const algByIndex = (i: number): AlgId => {
@@ -274,7 +271,7 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
   const saltPBKDF2 = randomBytes(CONFIG.pbkdf2SaltLen);
   const hkdfMaster = await deriveHKDFMaster(keys, saltPBKDF2);
 
-  let payload = new Uint8Array(plaintext); // becomes inner->outer progressively
+  let payload = new Uint8Array(plaintext);
   const layers: LayerMeta[] = [];
 
   for (let i = 0; i < keys.length; i++) {
@@ -285,7 +282,7 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
 
     if (alg === 'GCM') {
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 32);
-      const aesKey = await importAesGcmKey(keyBytes.buffer);
+      const aesKey = await importAesGcmKey(keyBytes);
       const iv = randomBytes(CONFIG.gcmIvLen);
       const { ct, tag } = await encryptGCM(payload, aesKey, iv, context);
       payload = ct;
@@ -293,8 +290,8 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
 
     } else if (alg === 'CTR-HMAC') {
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 64); // 32 enc + 32 mac
-      const encKey = await importAesCtrKey(keyBytes.slice(0,32).buffer);
-      const macKey = await importHmacKey(keyBytes.slice(32).buffer);
+      const encKey = await importAesCtrKey(keyBytes.slice(0, 32));
+      const macKey = await importHmacKey(keyBytes.slice(32));
       const iv = randomBytes(CONFIG.ctrIvLen);
       const { ct, tag } = await encryptCTR_HMAC(payload, encKey, macKey, iv, context);
       payload = ct;
@@ -302,8 +299,8 @@ export const encryptedDataClient = async (data: any, keys: ICryptoKey): Promise<
 
     } else { // CBC-HMAC
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 64); // 32 enc + 32 mac
-      const encKey = await importAesCbcKey(keyBytes.slice(0,32).buffer);
-      const macKey = await importHmacKey(keyBytes.slice(32).buffer);
+      const encKey = await importAesCbcKey(keyBytes.slice(0, 32));
+      const macKey = await importHmacKey(keyBytes.slice(32));
       const iv = randomBytes(CONFIG.cbcIvLen);
       const { ct, tag } = await encryptCBC_HMAC(payload, encKey, macKey, iv, context);
       payload = ct;
@@ -363,19 +360,19 @@ export const decryptedDataClient = async (encryptedData: any, keys: ICryptoKey):
 
     if (layer.a === 'GCM') {
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 32);
-      const aesKey = await importAesGcmKey(keyBytes.buffer);
+      const aesKey = await importAesGcmKey(keyBytes);
       payload = await decryptGCM(payload, tag, aesKey, iv, context);
 
     } else if (layer.a === 'CTR-HMAC') {
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 64);
-      const encKey = await importAesCtrKey(keyBytes.slice(0,32).buffer);
-      const macKey = await importHmacKey(keyBytes.slice(32).buffer);
+      const encKey = await importAesCtrKey(keyBytes.slice(0, 32));
+      const macKey = await importHmacKey(keyBytes.slice(32));
       payload = await decryptCTR_HMAC(payload, tag, encKey, macKey, iv, context);
 
     } else if (layer.a === 'CBC-HMAC') {
       const keyBytes = await hkdfBytes(hkdfMaster, layerSalt, info, 64);
-      const encKey = await importAesCbcKey(keyBytes.slice(0,32).buffer);
-      const macKey = await importHmacKey(keyBytes.slice(32).buffer);
+      const encKey = await importAesCbcKey(keyBytes.slice(0, 32));
+      const macKey = await importHmacKey(keyBytes.slice(32));
       payload = await decryptCBC_HMAC(payload, tag, encKey, macKey, iv, context);
 
     } else {
