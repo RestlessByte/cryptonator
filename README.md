@@ -1,4 +1,4 @@
-# 🔐 Cryptography fuction for security request data 
+# 🔐 Cryptography function for security request data 
 ## 🔑 Wee using N - count key for decrypt data witch client on server
 ### On server encrypt data other crypto function 'server.ts'
 
