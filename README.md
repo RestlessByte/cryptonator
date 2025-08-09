@@ -1,5 +1,5 @@
 # 🔐 Cryptography function for security request data 
-## 🔑 Wee using N - count key in array for decrypt data witch client on server
+## 🔑 Wee using N - count keys in array for decrypt data witch client on server
 ### On server encrypt data other crypto function 'server.ts'
 
 # How using?
