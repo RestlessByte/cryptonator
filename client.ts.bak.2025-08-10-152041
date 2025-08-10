@@ -1,0 +1,295 @@
+'use client';
+/**
+ * Hardened transport crypto (browser+Node via WebCrypto).
+ * ✔ Single layer AES-256-GCM (AEAD)
+ * ✔ PBKDF2-HMAC-SHA256 (1_000_000) -> HKDF-SHA256
+ * ✔ Deterministic nonce via HKDF(sessionSalt, "nonce|seq") -> 12B
+ * ✔ Strong AAD: ctx|proto|sid|seq|ts (binds ciphertext to context)
+ *
+ * Envelope v4 (Base64(JSON)):
+ * {
+ *   v:4, alg:"AES-256-GCM", kdf:"PBKDF2-1000000->HKDF",
+ *   s:pbkdf2SaltB64, ss:sessionSaltB64, t:128,
+ *   sid:base64(8B), seq:number, ts:number,
+ *   iv:b64, ct:b64
+ * }
+ */
+
+type ICryptoKey = string[]; // сохранили API
+type AnySubtle = SubtleCrypto;
+
+interface IConfig {
+  pbkdf2Iterations: number;
+  pbkdf2SaltLen: number;
+  sessionSaltLen: number; // для HKDF сессии
+  gcmIvLen: number;       // 12 bytes
+  gcmTagLen: number;      // bits
+}
+
+const CONFIG: IConfig = {
+  pbkdf2Iterations: 1_000_000, // подняли стоимость попытки
+  pbkdf2SaltLen: 16,
+  sessionSaltLen: 16,
+  gcmIvLen: 12,
+  gcmTagLen: 128,
+};
+
+/* ---------- Env ---------- */
+const getSubtle = (): AnySubtle => {
+  if (typeof globalThis !== 'undefined' && (globalThis as any).crypto?.subtle) {
+    return (globalThis as any).crypto.subtle as AnySubtle;
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const nodeCrypto = require('crypto');
+    if (nodeCrypto?.webcrypto?.subtle) return nodeCrypto.webcrypto.subtle as AnySubtle;
+  } catch {}
+  throw new Error('SubtleCrypto is not available.');
+};
+
+const getCrypto = (): Crypto => {
+  if (typeof globalThis !== 'undefined' && (globalThis as any).crypto) {
+    return (globalThis as any).crypto as Crypto;
+  }
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const nodeCrypto = require('crypto');
+    return nodeCrypto.webcrypto as unknown as Crypto;
+  } catch {}
+  throw new Error('Crypto is not available.');
+};
+
+const randomBytes = (len: number): Uint8Array => {
+  const out = new Uint8Array(len);
+  getCrypto().getRandomValues(out);
+  return out;
+};
+
+/* ---------- Encoding ---------- */
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+const toBase64 = (buf: ArrayBuffer | Uint8Array): string => {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  if (typeof btoa === 'function') {
+    let s = '';
+    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return require('buffer').Buffer.from(u8).toString('base64');
+};
+
+const fromBase64 = (b64: string): Uint8Array => {
+  if (typeof atob === 'function') {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  return new (require('buffer').Buffer)(b64, 'base64');
+};
+
+const isBase64 = (s: string): boolean => {
+  if (typeof s !== 'string' || !s.length) return false;
+  try { return toBase64(fromBase64(s)) === s; } catch { return false; }
+};
+
+const concatU8 = (...parts: Uint8Array[]) => {
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+};
+
+/** Гарантированный обычный ArrayBuffer (не SharedArrayBuffer) */
+const toArrayBuffer = (u8: Uint8Array): ArrayBuffer => {
+  const copy = new Uint8Array(u8.byteLength);
+  copy.set(u8);
+  return copy.buffer;
+};
+
+/* ---------- Context / AAD ---------- */
+const PROTO_V = 4;
+const ctxBase = 'ctx:v4|purpose=app-transport|suite=AES-256-GCM|v=4';
+const buildAAD = (sidB64: string, seq: number, ts: number): Uint8Array =>
+  enc.encode(`${ctxBase}|sid=${sidB64}|seq=${seq}|ts=${ts}`);
+
+/* ---------- Key material ---------- */
+const joinKeysMaterial = (keys: ICryptoKey): Uint8Array => {
+  if (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== 'string' || !k.trim())) {
+    throw new Error('Valid non-empty keys must be provided.');
+  }
+  // Один элемент достаточно, но оставляем общий формат (len|bytes|0x00)*
+  const parts: number[] = [];
+  for (const k of keys) {
+    const b = enc.encode(k);
+    parts.push((b.length >>> 24) & 0xff, (b.length >>> 16) & 0xff, (b.length >>> 8) & 0xff, b.length & 0xff);
+    for (let i = 0; i < b.length; i++) parts.push(b[i]);
+    parts.push(0x00);
+  }
+  return new Uint8Array(parts);
+};
+
+const importPBKDF2Base = async (keys: ICryptoKey): Promise<CryptoKey> => {
+  const material = joinKeysMaterial(keys);
+  return getSubtle().importKey('raw', toArrayBuffer(material), 'PBKDF2', false, ['deriveBits']);
+};
+
+const deriveHKDFMaster = async (keys: ICryptoKey, saltPBKDF2: Uint8Array): Promise<CryptoKey> => {
+  const base = await importPBKDF2Base(keys);
+  const subtle = getSubtle();
+  const ikmBits = await subtle.deriveBits(
+    { name: 'PBKDF2', salt: toArrayBuffer(saltPBKDF2), iterations: CONFIG.pbkdf2Iterations, hash: 'SHA-256' },
+    base,
+    32 * 8 // 256-bit IKM
+  );
+  const ikm = new Uint8Array(ikmBits);
+  return subtle.importKey('raw', toArrayBuffer(ikm), 'HKDF', false, ['deriveBits']);
+};
+
+const hkdfBytes = async (hkdfKey: CryptoKey, salt: Uint8Array, info: Uint8Array, nBytes: number): Promise<Uint8Array> => {
+  const subtle = getSubtle();
+  const bits = await subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: toArrayBuffer(salt), info: toArrayBuffer(info) },
+    hkdfKey,
+    nBytes * 8
+  );
+  return new Uint8Array(bits);
+};
+
+const importAesGcmKey = async (raw: Uint8Array): Promise<CryptoKey> =>
+  getSubtle().importKey('raw', toArrayBuffer(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+
+/* ---------- GCM ---------- */
+async function encryptGCM(plaintext: Uint8Array, key: CryptoKey, iv: Uint8Array, aad: Uint8Array) {
+  const subtle = getSubtle();
+  const params: AesGcmParams = { name: 'AES-GCM', iv: toArrayBuffer(iv), tagLength: CONFIG.gcmTagLen, additionalData: toArrayBuffer(aad) };
+  const out = new Uint8Array(await subtle.encrypt(params, key, toArrayBuffer(plaintext)));
+  const tagLenB = CONFIG.gcmTagLen / 8;
+  return { ct: out.slice(0, out.length - tagLenB), tag: out.slice(out.length - tagLenB) };
+}
+async function decryptGCM(ciphertext: Uint8Array, tag: Uint8Array, key: CryptoKey, iv: Uint8Array, aad: Uint8Array) {
+  const subtle = getSubtle();
+  const params: AesGcmParams = { name: 'AES-GCM', iv: toArrayBuffer(iv), tagLength: CONFIG.gcmTagLen, additionalData: toArrayBuffer(aad) };
+  const plain = await subtle.decrypt(params, key, toArrayBuffer(concatU8(ciphertext, tag)));
+  return new Uint8Array(plain);
+}
+
+/* ---------- Public API ---------- */
+interface EnvelopeV4 {
+  v: number;           // 4
+  alg: 'AES-256-GCM';
+  kdf: string;         // 'PBKDF2-1000000->HKDF'
+  s: string;           // pbkdf2 salt (b64)
+  ss: string;          // session salt (b64)
+  t: number;           // gcm tag bits
+  sid: string;         // session id (b64, 8B)
+  seq: number;         // message sequence
+  ts: number;          // timestamp (ms)
+  iv: string;          // nonce/iv (b64)
+  ct: string;          // ciphertext (b64)
+}
+
+type EncryptOpts = {
+  sessionIdB64?: string; // если не дан — сгенерим 8B
+  seq?: number;          // если не дан — 0
+  ts?: number;           // если не дан — Date.now()
+};
+
+export const encryptedDataClient = async (data: any, keys: ICryptoKey, opts: EncryptOpts = {}): Promise<string> => {
+  if (data === undefined || data === null) throw new Error('No data to encrypt.');
+  if (!Array.isArray(keys) || keys.length === 0) throw new Error('keys[] must be non-empty.');
+
+  const plaintext = enc.encode(JSON.stringify(data));
+  const saltPBKDF2 = randomBytes(CONFIG.pbkdf2SaltLen);
+  const hkdfMaster = await deriveHKDFMaster(keys, saltPBKDF2);
+
+  const sessionSalt = randomBytes(CONFIG.sessionSaltLen);
+  const sidU8 = opts.sessionIdB64 ? fromBase64(opts.sessionIdB64) : randomBytes(8);
+  const sidB64 = opts.sessionIdB64 ?? toBase64(sidU8);
+  const seq = Number.isFinite(opts.seq) ? (opts.seq as number) : 0;
+  const ts = typeof opts.ts === 'number' ? (opts.ts as number) : Date.now();
+
+  // K_enc и nonce детерминированно из sessionSalt
+  const kEncBytes = await hkdfBytes(hkdfMaster, sessionSalt, enc.encode('v4|key|enc'), 32);
+  const iv = await hkdfBytes(hkdfMaster, sessionSalt, enc.encode(`v4|nonce|${seq}`), CONFIG.gcmIvLen);
+
+  const aesKey = await importAesGcmKey(kEncBytes);
+  const aad = buildAAD(sidB64, seq, ts);
+  const { ct, tag } = await encryptGCM(plaintext, aesKey, iv, aad);
+
+  const env: EnvelopeV4 = {
+    v: PROTO_V,
+    alg: 'AES-256-GCM',
+    kdf: `PBKDF2-${CONFIG.pbkdf2Iterations}->HKDF`,
+    s: toBase64(saltPBKDF2),
+    ss: toBase64(sessionSalt),
+    t: CONFIG.gcmTagLen,
+    sid: sidB64,
+    seq,
+    ts,
+    iv: toBase64(iv),
+    ct: toBase64(concatU8(ct, tag)), // совместимо: iv отдельно, ct+tag вместе
+  };
+
+  return toBase64(enc.encode(JSON.stringify(env)));
+};
+
+export const decryptedDataClient = async (encryptedData: any, keys: ICryptoKey): Promise<any> => {
+  if (!encryptedData) throw new Error('No data provided for decryption.');
+  if (typeof encryptedData !== 'string' || !isBase64(encryptedData)) {
+    throw new TypeError('Expected Base64-encoded payload.');
+  }
+
+  let jsonStr = '';
+  try {
+    jsonStr = dec.decode(fromBase64(encryptedData));
+  } catch {
+    throw new Error('Invalid envelope (not Base64(JSON)).');
+  }
+
+  let env: Partial<EnvelopeV4>;
+  try {
+    env = JSON.parse(jsonStr);
+  } catch {
+    throw new Error('Invalid JSON envelope.');
+  }
+
+  // Проверка конверта v4
+  if (!env || env.v !== PROTO_V || env.alg !== 'AES-256-GCM' || typeof env.ct !== 'string'
+      || typeof env.s !== 'string' || typeof env.ss !== 'string'
+      || typeof env.sid !== 'string' || typeof env.iv !== 'string'
+      || typeof env.seq !== 'number' || typeof env.ts !== 'number') {
+    throw new Error('Malformed envelope (v4).');
+  }
+
+  const saltPBKDF2 = fromBase64(env.s as string);
+  const sessionSalt = fromBase64(env.ss as string);
+  const hkdfMaster = await deriveHKDFMaster(keys, saltPBKDF2);
+
+  const kEncBytes = await hkdfBytes(hkdfMaster, sessionSalt, enc.encode('v4|key|enc'), 32);
+  const iv = fromBase64(env.iv as string);
+  const sidB64 = env.sid as string;
+  const seq = env.seq as number;
+  const ts = env.ts as number;
+
+  const ctWithTag = fromBase64(env.ct as string);
+  const tagLenB = CONFIG.gcmTagLen / 8;
+  if (ctWithTag.length < tagLenB) throw new Error('Ciphertext too short.');
+  const ct = ctWithTag.slice(0, ctWithTag.length - tagLenB);
+  const tag = ctWithTag.slice(ctWithTag.length - tagLenB);
+
+  const aesKey = await importAesGcmKey(kEncBytes);
+  const aad = buildAAD(sidB64, seq, ts);
+
+  const plain = await decryptGCM(ct, tag, aesKey, iv, aad);
+  try {
+    return JSON.parse(dec.decode(plain));
+  } catch {
+    throw new Error('Decrypted payload is not valid JSON.');
+  }
+};
