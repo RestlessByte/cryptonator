@@ -175,7 +175,9 @@ const importHmacKey = async (raw: Uint8Array): Promise<CryptoKey> =>
 
 /* ---------- PKCS#7 for CBC ---------- */
 function pkcs7Pad(data: Uint8Array, blockSize = 16): Uint8Array {
-  const padLen = blockSize - (data.length % blockSize || blockSize);
+  // ФИКС: при длине, кратной блоку, добавляем полный блок паддинга
+  const rem = data.length % blockSize;
+  const padLen = rem === 0 ? blockSize : (blockSize - rem);
   const pad = new Uint8Array(padLen);
   pad.fill(padLen);
   return concatU8(data, pad);
